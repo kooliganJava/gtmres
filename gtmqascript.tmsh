@@ -1,0 +1,609 @@
+cli script /Common/gtmres {
+proc script::init {} {
+    set ::lb_modes {completion-rate cpu drop-packet fallback-ip fewest-hops global-availability kilobytes-per-second least-connections lowest-round-trip-time none packet-rate quality-of-service ratio return-to-dns round-robin static-persistence topology virtual-server-capacity virtual-server-score}
+    set ::lb_codes {CR CPU DP  FIP FH GA KBS LC RTT NA PR QOS RA R2D RR SP TO VC VS}
+}
+
+proc script::run {} {
+	
+		tmsh::cd /
+
+    set nosave            [getopt -n]
+    set diffonly          [getopt -i]
+    set refresh_all				[getopt -r]
+    set refresh_bind			[expr {[getopt -rn]  || $refresh_all}]
+    set refresh_gtm				[expr {[getopt -rc]  || $refresh_all}]
+  	set show_config_only	[getopt -S]
+  	set show_config				[expr {[getopt -s] || $show_config_only}]
+  	getopt -h resolvers
+  	
+  	# If user doesn't specify server(s), we need to find out what server we'll be using, i.e. what's in our resolv.conf if anything.
+  	# d +short +identify gives this.
+		#i.root-servers.net. from server some.i.p.address in 19 ms.
+		#c.root-servers.net. from server some.i.p.address in 19 ms.
+		#a.root-servers.net. from server some.i.p.address in 19 ms.
+		#g.root-servers.net. from server some.i.p.address in 19 ms.
+		#e.root-servers.net. from server some.i.p.address in 19 ms.
+		#h.root-servers.net. from server some.i.p.address in 19 ms.
+		#b.root-servers.net. from server some.i.p.address in 19 ms.
+		#d.root-servers.net. from server some.i.p.address in 19 ms.
+		#j.root-servers.net. from server some.i.p.address in 19 ms.
+		#l.root-servers.net. from server some.i.p.address in 19 ms.
+		#k.root-servers.net. from server some.i.p.address in 19 ms.
+		#m.root-servers.net. from server some.i.p.address in 19 ms.
+		#f.root-servers.net. from server some.i.p.address in 19 ms.
+  	if {![info exists resolvers]}{
+			set resolvers [lindex [exec  dig +short +identify ] 3 ]
+		}
+  
+
+
+    ## Get user permission to create dir gtmres in their home dir if it doesn't exist.
+    if {![file isdirectory "/shared/tmp/gtmres"]}{
+        puts "OK to create /shared/tmp/gtmres to retain state info? (y/n)"
+        set answer [read stdin 1]
+        if {$answer eq "y"}{
+            file mkdir "/shared/tmp/gtmres"
+        }
+    }
+
+    array set past_results {}
+    set past_result_sets [open "|ls -St /var/tmp/gtmres/" RDONLY]
+    while {[gets $past_result_sets past_results_file]>=0}{
+        if {[regexp {query_results_([0-9]+)\.list} $past_results_file ==> results_time]}{
+            puts "Loading historical data from $past_results_file."
+            set file_chan [open "/shared/tmp/gtmres/$past_results_file" RDONLY]
+            set result_list [read $file_chan]
+            close $file_chan
+            foreach {fqdn ipaddress ns} $result_list {
+                append past_results($fqdn) " $results_time $ipaddress $ns"
+            }
+        }
+        break
+    }
+    close $past_result_sets
+
+    if {!$refresh_bind}{
+        if {[file exists "/shared/tmp/gtmres/ns_records.conf"]}{
+            puts "Have BIND records."
+            set chan_ns_records [open "/shared/tmp/gtmres/ns_records.conf" r]
+            array set ns_records [read $chan_ns_records]
+            close $chan_ns_records
+        }
+    } else {
+        if {$refresh_bind}{
+            puts "Re-reading BIND configuration."
+        } else {
+            puts "No prior BIND records present."
+        }
+        #############################################################################################################
+        #############################################################################################################
+        ## Find out what BIND knows.  Produce a map of all hosted 'A' records per domain.
+        array set ns_records {}
+        set named_conf [open "/var/named/config/named.conf" RDONLY]
+        while {[gets $named_conf line]>=0}{
+           if {[regexp {^\s+zone\s+\"([^\"]+)\"} $line ==> zone]}{
+               set dig_zone [open "|dig @localhost -taxfr $zone" RDONLY]
+               while {[gets $dig_zone ns_record]>=0}{
+                   if {[regexp {\s+IN\s+A\s+} $ns_record]}{
+                       set host [string range [lindex [split $ns_record] 0] 0 end-1]
+                       set type [lindex [split $ns_record] 3]
+                       set data [lindex [split $ns_record] 4]
+                       set ns_list [list $type $data]
+                       if {[info exists ns_records($host)]}{
+                           append ns_records($host) " $ns_list"
+                       } else {
+                           set ns_records($host) $ns_list
+                       }
+                       #puts "$host $ns_list"
+                   }
+               }
+           }
+        }
+        close $named_conf
+        set chan_ns_records [open "/shared/tmp/gtmres/ns_records.conf" a]
+        puts $chan_ns_records [array get ns_records]
+        close $chan_ns_records
+    }
+
+    #############################################################################################################
+
+    if {!$refresh_gtm}{
+        if {[file exists "/shared/tmp/gtmres/wip_map.conf"]}{
+            puts "Have GTM config."
+            set chan_wip_map [open "/shared/tmp/gtmres/wip_map.conf" r]
+            set wip_map [read $chan_wip_map]
+            close $chan_wip_map
+            set chan_vs_dc_map [open "/shared/tmp/gtmres/vs_dc_map.conf" r]
+            set ::vs_dc_map [read $chan_vs_dc_map]
+            close $chan_vs_dc_map
+        }
+    } else {
+        if {$refresh_gtm}{
+            puts "Refreshing GTM configuration."
+        } else {
+            puts "No prior GTM config present."
+        }
+        
+        #############################################################################################################
+        #############################################################################################################
+        ## Compile a list, vs_dc_map, of 
+        ##  0 virtual server names
+        ##  1 virtual server destination IPs
+        ##  2 virtual server datacenters
+        foreach gtm_server [tmsh::get_config /gtm recursive server datacenter virtual-servers] {
+            set server_name /[tmsh::get_name $gtm_server]
+            set vs_datacenter [strip_partition [tmsh::get_field_value $gtm_server "datacenter"]]
+            foreach vs [tmsh::get_field_value $gtm_server "virtual-servers"] {
+                set vs_name [tmsh::get_name $vs]
+                set vs_name [expr {[regexp / $vs_name]?"/${vs_name}":${vs_name}}]
+                set vs_destination [lindex [split [tmsh::get_field_value $vs "destination"] :] 0]
+                lappend ::vs_dc_map ${server_name}:$vs_name $vs_destination $vs_datacenter
+            }
+        }
+        #############################################################################################################
+
+        #############################################################################################################
+        #############################################################################################################
+        ## Get a list of all WIPs.
+        ## For each WIP, determine all of the possible responses (IPs) to a query.
+        ## For each potential response, associate a DC with it.
+        ## If possible, for each potential response, associate an LB method with it.
+        foreach gtm_wideip_obj [tmsh::get_config /gtm recursive wideip pools pool-lb-mode] {
+            set wideip_name /[tmsh::get_name $gtm_wideip_obj]
+            lappend wip_list $wideip_name
+            set name_len [string length $wideip_name]
+            set wip_pllb [lindex {GA RR RA TO} [lsearch {global-availability round-robin ratio topology } [tmsh::get_field_value $gtm_wideip_obj "pool-lb-mode"]]]
+            #specputs -nonewline wideip_name wip_pllb
+            set pools_map ""
+            foreach gtm_pools_val [tmsh::get_field_value $gtm_wideip_obj "pools"] {
+                set pool_map ""
+                set pool_order [tmsh::get_field_value $gtm_pools_val "order"]
+                #specputs -nonewline pool_order 
+                foreach gtm_pool_obj [tmsh::get_config /gtm recursive pool [lindex $gtm_pools_val 1] all-properties] {
+                    set pool_fields_nest [tmsh::get_field_names nested  $gtm_pool_obj]
+                    set pool_fields_valu [tmsh::get_field_names value   $gtm_pool_obj]
+                    set    pool_lb_order   [lindex $::lb_codes [lsearch $::lb_modes [tmsh::get_field_value $gtm_pool_obj "load-balancing-mode"]]]
+                    append pool_lb_order "-[lindex $::lb_codes [lsearch $::lb_modes [tmsh::get_field_value $gtm_pool_obj "alternate-mode"]]]"
+                    append pool_lb_order "-[lindex $::lb_codes [lsearch $::lb_modes [tmsh::get_field_value $gtm_pool_obj "fallback-mode"]]]"
+                    #specputs -nonewline pool_lb_order
+                    foreach mode [lsearch -inline -all $pool_fields_valu "*-mode"] {
+                        set modeval [tmsh::get_field_value $gtm_pool_obj $mode]
+                        set vs_order [lindex {p a f} [lsearch {load-balancing-mode alternate-mode fallback-mode} $mode]]
+                        switch $modeval {
+                            "none"          { continue }
+                            "fallback-ip"   {
+                                if {[lsearch $pool_fields_valu "fallback-ipv4"]>=0}{
+                                    tmsh::get_field_value $gtm_pool_obj "fallback-ipv4" fip
+                                    if {$fip eq "none"}{continue}
+                                    if {$fip eq "any"}{continue}
+                                    set vs_destination $fip
+                                    set vs_dc          "fallback"
+                                    #specputs -nonewline vs_order vs_destination vs_dc
+                                    lappend pool_map [list $vs_order $vs_destination $vs_dc]
+                                }
+                            }
+                            "return-to-dns" {
+                                if {[info exists ns_records($wideip_name)]}{
+                                    set vs_dc          "r2d"
+                                    foreach {rrtype rrdata} $ns_records($wideip_name) {
+                                        set vs_destination $rrdata
+                                        #specputs -nonewline vs_order vs_destination vs_dc
+                                        lappend pool_map [list $vs_order $vs_destination $vs_dc]
+                                    }
+                                }
+                            }
+
+                            default         { continue }
+                        }
+                    }
+                    if {[lsearch -exact $pool_fields_nest "members"]<0}{continue}
+                    foreach vs_name [tmsh::get_field_value $gtm_pool_obj "members"] {
+                        set vs_order [tmsh::get_field_value $vs_name "order"]
+                        set vs_name /[lindex $vs_name 1]
+                        set nameidx [lsearch -exact $::vs_dc_map $vs_name]
+                        if {$nameidx>=0} {
+                            set vs_destination [lindex $::vs_dc_map [incr nameidx]]
+                            set vs_dc          [lindex $::vs_dc_map [incr nameidx]]
+                            #specputs -nonewline vs_order vs_destination vs_dc
+                            lappend  pool_map [list $vs_order $vs_destination $vs_dc]
+                        }
+                    }
+                }
+                lappend pools_map [list $pool_order $pool_lb_order [lsort -index 0 $pool_map]]
+            }
+            #puts "\nPOOLS_MAP==>$pools_map<==\n"
+            lappend wip_map [list $wideip_name $wip_pllb [lsort -index 0 $pools_map]]
+        }
+        #############################################################################################################
+        set chan_wip_map [open "/shared/tmp/gtmres/wip_map.conf" w]
+        puts $chan_wip_map $wip_map
+        close $chan_wip_map
+        set chan_vs_dc_map [open "/shared/tmp/gtmres/vs_dc_map.conf" w]
+        puts $chan_vs_dc_map $::vs_dc_map
+        close $chan_vs_dc_map
+    }
+
+    if {$show_config}{
+    	display_wip_map $wip_map
+    	if {$show_config_only}{exit}
+    }
+    
+
+    #############################################################################################################
+    #############################################################################################################
+    ## Conduct name resolution tests based on information gathered.
+    puts "<-=-><-=-><-=-><-=-><-=-><-=-><-=-><-=-><-=-><-=-><-=-><-=-><-=-><-=-><-=-><-=-><-=-><-=-><-=-><-=-><-=-><-=->"
+		set outfmt1 "%-60s%-15s%-16s%-16s"
+    foreach {wip} $wip_map {
+        set wip_name  [lindex [split [lindex $wip 0] /] end]
+        set wip_pllb  [lindex $wip 1]
+        set wip_pools [lindex $wip 2]
+        foreach resolver $resolvers {
+        set response [exec dig @$resolver +short +identify $wip_name]
+        set answer [lindex $response 0]
+        set server [lindex $response 3]
+        lappend results_lst $wip_name $answer $server
+        set diffcount 0
+        if {$diffonly}{
+            if {[info exists past_results($wip_name)]}{
+                foreach {restime past_answer past_server} $past_results($wip_name) {
+                	incr diffcount [expr {($server eq $past_server) && ($answer ne $past_answer)}]
+                }
+                if {!$diffcount}{continue}
+            }
+        }
+        puts -nonewline "[format $outfmt1 $wip_name @$server now $answer  ]"
+        foreach pool $wip_pools {
+            set order  [lindex $pool 0]
+            set method [lindex $pool 1]
+            set mbrs   [lindex $pool 2]
+            foreach mbr $mbrs {
+                set ip     [lindex $mbr 1]
+                if {$ip eq $answer} {
+                    set porder "$order[lindex $mbr 0]"
+                    set dc     [lindex $mbr 2]
+                    specputs -nonewline porder dc
+                }
+            }
+        }
+        puts ""
+        if {[info exists past_results($wip_name)]}{
+            foreach {restime past_answer past_server} $past_results($wip_name) {
+                if {${server} eq ${past_server}}{ if {${answer} eq ${past_answer}}{continue}}
+                puts -nonewline "[format $outfmt1 $wip_name @$past_server $restime $past_answer]"
+                foreach pool $wip_pools {
+                    set order  [lindex $pool 0]
+                    set method [lindex $pool 1]
+                    set mbrs   [lindex $pool 2]
+                    foreach mbr $mbrs {
+                        set ip     [lindex $mbr 1]
+                        if {$ip eq $past_answer} {
+                            set porder "$order[lindex $mbr 0]"
+                            set dc     [lindex $mbr 2]
+                            specputs -nonewline porder dc
+                        }
+                    }
+                }
+                puts ""
+            }
+        }
+    }
+  }
+    set results_chan [open "/shared/tmp/gtmres/query_results_[clock format [clock seconds] -format "%Y%m%d%H%M%S"].list" a]
+    puts $results_chan $results_lst
+    close $results_chan
+}
+
+proc display_wip_map {wip_map_list} {
+    #############################################################################################################
+    #############################################################################################################
+    ## Display information gathered (wip_map).
+    foreach {wip} $wip_map_list {
+        set wip_name  [lindex $wip 0]
+        set wip_pllb  [lindex $wip 1]
+        set wip_pools [lindex $wip 2]
+        set wip_data($wip_name) "$wip_pllb $wip_pools"
+        set answer [exec dig +short $wip_name]
+        diagram_wip $wip_name
+        foreach pool $wip_pools {
+            set order  [lindex $pool 0]
+            set method [lindex $pool 1]
+            set mbrs   [lindex $pool 2]
+            puts "\t$order $method"
+            foreach mbr $mbrs {
+                set ip     [lindex $mbr 1]
+                set porder [lindex $mbr 0]
+                set dc     [lindex $mbr 2]
+                puts "\t\t$ip $porder $dc"
+            }
+        }
+    }
+}
+proc script::help {} {
+}
+proc specputs {args} {
+        set largs [split $args]
+        set oargs ""
+        set outfmt "\""
+        set switches ""
+        for {set i 0} {$i<=[llength $largs]-1} {incr i}{
+            set str [lindex $largs $i]
+            if {[string index $str 0] eq "-"}{
+                append switches " $str"
+                continue
+            }
+            #puts "STR==>$str<=="
+            namespace eval specvars {
+                array set vars {}
+                array set vars_maxlen {}
+            }
+            upvar $str myvar
+            set ::specvars::vars($str) $myvar
+            set myvar_strlen [string length $::specvars::vars($str)]
+            if {![info exists ::specvars::vars_maxlen($str)]}{
+                set ::specvars::vars_maxlen($str) [expr $myvar_strlen+2]
+            }
+            if {$myvar_strlen > $::specvars::vars_maxlen($str)}{
+                set ::specvars::vars_maxlen($str) [expr $myvar_strlen+2]
+            }
+
+            puts -nonewline [format [subst "%-$::specvars::vars_maxlen($str)s"] [uplevel set $str]]
+        }
+       if {$switches ne ""}{
+           puts -nonewline ""
+       } else {
+           puts ""
+       }
+}
+proc strip_partition {arg_str} {
+    return [lindex [split $arg_str /] end]
+}
+proc diagram_wip {strWipName} {
+	set wip_host              [lindex [split [lindex [split $strWipName /] end] "."] 0]
+	set wip_pools             ""
+	set wip_pool_mbrs         ""
+	set total_pool_name_lengths     0
+	set pool_name_format      ""
+	set wideip_obj           [tmsh::get_config       /gtm wideip $strWipName all-properties]
+	set wip_pools_obj        [dig4val $wideip_obj "pools"]
+	
+
+	#WIP Name centered in 132 columns
+	puts "[string repeat " " [expr {66-[string length $wip_host]/2}]]$wip_host -> [dig4val $wideip_obj "pool-lb-mode"]"
+
+	
+	if {1}{# Build list of pools and members
+		set total_pool_name_lengths 0
+		set total_mbr_name_lengths  0
+		set pool_name_lengths ""
+		set mbr_name_lengths ""
+		foreach {pool_name pool_props} $wip_pools_obj {
+			if {[regexp {none} $pool_name]}{return}
+			set pool_obj [tmsh::get_config /gtm pool $pool_name alternate-mode fallback-ipv4 fallback-mode load-balancing-mode members]
+			set porder   [dig4val $pool_props "order"]
+			set pratio   [dig4val $pool_props "ratio"]
+			set amode    [dig4val $pool_obj   "alternate-mode"]
+			set fip      [dig4val $pool_obj   "fallback-ipv4"]
+			set fmode    [dig4val $pool_obj   "fallback-mode"]
+			set lmode    [dig4val $pool_obj   "load-balancing-mode"]
+			
+			set mbrs ""
+			foreach {name props} [dig4val $pool_obj "members"] {
+				# strip partition/ from left of member name.
+				set mbr   [lindex [split $name /] end]
+				set order [dig4val $props "order"]
+				set ratio [dig4val $props "ratio"]
+				set ip    [lindex $::vs_dc_map [expr {[lsearch $::vs_dc_map /$name]+1}]]
+
+				## Simplify member name.  Remove server component, everything to teh left of : including :.
+				regsub "^.*\:" $mbr "" mbr
+
+				lappend mbrs [list $mbr $ip o:$order r:$ratio]
+				lappend mbr_names $mbr
+				#"total_pool_name_lengths" is actually the sum of the lengths of the first member in each pool
+				if {[llength $mbrs]==1}{
+					incr total_mbr_name_lengths [string length [lindex [lindex $mbrs 0] 0]]
+					lappend mbr_name_lengths [string length $mbr]
+				}
+			}
+			set pool_name [lindex [split $pool_name /] end]
+			lappend wip_pools $pool_name
+			lappend wip_pool_mbrs $pool_name [list $mbrs]
+			incr total_pool_name_lengths [string length $pool_name]
+			lappend pool_name_lengths [string length $pool_name]
+			array set arrPoolProps [list $pool_name [list "o $porder" "r $pratio" "l $lmode" "a $amode" "f $fmode" "i $fip"]]
+		}
+	}
+	#puts "wip_pool_mbrs $wip_pool_mbrs"
+	if {1}{# Determine governing name length.
+		if {$total_pool_name_lengths>=$total_mbr_name_lengths}{
+			set gov pool
+			set govlengths $pool_name_lengths
+			set govnames $wip_pools
+			set total_name_lengths $total_pool_name_lengths
+		} else {
+			set gov mbr
+			set govlengths $mbr_name_lengths
+			set govnames $mbr_names
+			set total_name_lengths $total_mbr_name_lengths
+		}
+	}
+	if {1}{# Determine spacing between pool names
+		# (132-total_length_of_pool_names)/({# of pools or mbrs} - 1)
+		set tab_pos ""
+		if {[llength $wip_pools]>1}{
+			set namespacing_after [expr {(132-$total_name_lengths)/([llength $wip_pools]-1)}]
+			set namespacing_before 0
+			lappend tab_pos $namespacing_before
+			for {set ctr 1} {$ctr <=[llength $wip_pools-1]} {incr ctr} {
+				#{position of leftward member}+{length of leftward member}+{namespacing_after}.
+				lappend tab_pos [expr {[lindex $tab_pos [expr {$ctr-1}]]+[lindex $govlengths [expr {$ctr-1}]]+$namespacing_after}]
+			}
+		} else {
+			set namespacing_after  0
+			set namespacing_before [expr {66-[string length [lindex $wip_pools 0]]/2}]
+			lappend tab_pos $namespacing_before
+		}
+	}
+	if {1}{# Pool names
+		set lastnewline 0
+		if {[llength $wip_pools]==1}{
+			puts [string repeat " " [expr {66-[string length [lindex $wip_pools 0]]/2}]][lindex $wip_pools 0]
+		} else {
+			for {set ctr1 0} {$ctr1<=[llength $wip_pools]-1} {incr ctr1} {
+				if {!$ctr1}{
+					puts -nonewline [string repeat " " [set pos [lindex $tab_pos $ctr1]] ]
+				}
+				puts -nonewline [set str [lindex $wip_pools $ctr1]]
+				incr pos [string length $str]
+				if {$ctr1!=[llength $wip_pools]}{
+					if {$pos<=[lindex $tab_pos [set idx [expr {$ctr1+1}]]]}{
+						puts -nonewline [string repeat " " [expr {[lindex $tab_pos $idx]-$pos}]]
+					}
+				} else {
+						puts ""
+						set lastnewline 1
+				}
+				set pos [lindex $tab_pos $idx]
+			}
+		if {!$lastnewline} {puts ""}
+		}
+	}
+	if {1}{# Pool properties
+		set lastnewline 0
+		if {[llength $wip_pools]==1}{
+			foreach prop $arrPoolProps([lindex $wip_pools 0]) {
+				puts " [string repeat " " [expr {66-[string length [lindex $wip_pools 0]]/2}]]$prop"
+			}
+		} else {
+			set upper1 [llength $arrPoolProps([lindex $wip_pools 0])]-1
+			set upper2 [llength $wip_pools]-1
+			for {set ctr1 0} {$ctr1<=$upper1} {incr ctr1} {
+				for {set ctr2 0} {$ctr2<=[llength $wip_pools]-1} {incr ctr2} {
+					if {!$ctr2}{
+						puts -nonewline [string repeat " " [lindex $tab_pos $ctr2] ]
+						set pos [lindex $tab_pos $ctr2]
+					}
+					puts -nonewline " [lindex $arrPoolProps([lindex $wip_pools $ctr2]) $ctr1]"
+					incr pos [string length [lindex $arrPoolProps([lindex $wip_pools $ctr2]) $ctr1]]
+					if {$ctr2!=[llength $wip_pools]}{
+						if {$pos<=[lindex $tab_pos [set idx [expr {$ctr2+1}]]]}{
+							puts -nonewline [string repeat " " [expr {[lindex $tab_pos $idx]-$pos}]]
+						}
+					} else {
+							puts ""
+							set lastnewline 1
+					}
+					set pos [lindex $tab_pos $idx]
+				}
+				if {!$lastnewline}  {puts ""}
+			}
+		}
+	}
+	if {1}{# Get member count of pool with most members
+		set most_mbrs 0
+		foreach {pool mbrs} $wip_pool_mbrs {
+			set mbrcount [llength [lindex $mbrs 0]]
+			if {!$most_mbrs}{
+				set most_mbrs $mbrcount
+			} elseif {$mbrcount>$most_mbrs}{
+				set most_mbrs $mbrcount
+			}
+		}
+	}
+	if {1}{# Member names
+		#Iterate from 0 to the number of members of pool with most members.
+		set pos 0
+		for {set i 0} {$i<=[expr {$most_mbrs-1}]} {incr i} {
+			set pos 0
+			#Iterate through pools - print member names
+			for {set j 0} {$j<=[expr {[llength $wip_pool_mbrs]-2}]} {incr j 2} {
+				if {!$j}{
+					puts -nonewline [string repeat " " [lindex $tab_pos [set idx [expr {$j/2}]]] ]
+					set pos [lindex $tab_pos $idx ]
+				}
+				# wip_pool_mbrs poolname { member_name {memberprop1 memberprop2} }
+				set strMbr [lindex [lindex [lindex [lindex $wip_pool_mbrs [expr {$j+1}]] 0] $i] 0]
+				puts -nonewline $strMbr
+				incr pos [string length $strMbr]
+				if {$j!=[expr {[llength $wip_pool_mbrs]-2}]}{
+					if {$pos<[lindex $tab_pos [set idx [expr {$j/2+1}]]]}{
+						puts -nonewline [string repeat " " [expr {[lindex $tab_pos $idx]-$pos}]]
+						set pos [lindex $tab_pos $idx]
+					}
+				} else {
+					puts ""
+				}
+			}
+			#Iterate through pools - print member properties
+			for {set j 0} {$j<=[expr {[llength $wip_pool_mbrs]-2}]} {incr j 2} {
+				if {!$j}{
+					puts -nonewline [string repeat " " [lindex $tab_pos [set idx [expr {$j/2}]]] ]
+					set pos [lindex $tab_pos $idx ]
+				}
+				# wip_pool_mbrs poolname { member_name {memberprop1 memberprop2} }
+				set strMbr [lrange [lindex [lindex [lindex $wip_pool_mbrs [expr {$j+1}]] 0] $i] 1 end]
+				puts -nonewline " $strMbr"
+				incr pos [string length $strMbr]
+				if {$j!=[expr {[llength $wip_pool_mbrs]-2}]}{
+					if {$pos<[lindex $tab_pos [set idx [expr {$j/2+1}]]]}{
+						puts -nonewline [string repeat " " [expr {[lindex $tab_pos $idx]-$pos}]]
+						set pos [lindex $tab_pos $idx]
+					}
+				} else {
+					puts ""
+				}
+			}
+			puts ""
+		}
+	}
+}	
+proc dig4val {obj valname} {
+	#####################################################################################################
+	############################################  IN:  1) BIG-IP configuration object                 ###
+	####        _ _       _  _             _ ###       2) The name of a value                         ###
+	####     __| (_) __ _| || |__   ____ _| |###                                                      ###
+	####    / _` | |/ _` | || |\ \ / / _` | |###  Out: A value, if it exists in the object            ###
+	####   | (_| | | (_| |__   _\ V / (_| | |###                                                      ###
+	####    \__,_|_|\__, |  |_|  \_/ \__,_|_|###                                                      ###
+	####            |___/                    ###                                                      ###
+	############################################                                                      ###
+	#####################################################################################################
+	for {set i 0} {$i<=([llength $obj]-1)} {incr i} {
+		if {[llength [set obj_idx [lindex $obj $i]]]>1} {
+			if {[set retval [dig4val $obj_idx $valname]] ne ""} {
+				return $retval
+			}
+		} elseif {$obj_idx eq $valname} {
+				return [lindex $obj [expr {$i+1}]]
+		}
+	}
+	return ""
+	######################################################################################################
+}
+proc getopt {name {_var ""} {default ""}} {
+ upvar 1 $_var var
+ set pos [lsearch -exact $tmsh::argv $name]
+ if {$pos>=0} {
+     set to $pos
+     if {$_var ne ""} {
+         set var [lindex $tmsh::argv [incr to]]
+     }
+     set tmsh::argv [lreplace $tmsh::argv $pos $to]
+     return 1
+ } else {
+     if {[llength [info level 0]] == 5} {set var $default}
+     return 0
+ }
+}
+
+proc ipOfVs {strArg}{
+	set server_name					[lindex [split $strArg :] 0]
+	set virtual_server_name	[lindex [split $strArg :] 1]
+	puts [tmsh::get_config gtm server $server_name virtual-servers { $virtual_server_name { destination } }]
+}
+
+proc script::tabc {} {
+}
+}
